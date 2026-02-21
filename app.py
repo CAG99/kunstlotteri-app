@@ -159,7 +159,7 @@ with st.expander("Innstillinger", expanded=False):
     round_down = st.checkbox("Rund ned til heltall lodd (anbefalt)", value=True)
 
 if not uploaded:
-    st.info("Last opp en Vipps-rapporten for å komme i gang.")
+    st.info("Last opp Vipps-rapporten for å komme i gang.")
     st.stop()
 
 try:
