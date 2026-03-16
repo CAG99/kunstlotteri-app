@@ -11,43 +11,115 @@ from urllib.parse import quote
 # -----------------------------
 # Helpers
 # -----------------------------
-BILDE_RE = re.compile(r"lodd\s*bilde\s*([A-Z])", re.IGNORECASE)
+BILDE_RE = re.compile(r"lodd\s*bilde\s*([A-Z])(?:\s|-|$)", re.IGNORECASE)
 
-def find_header_row(raw: pd.DataFrame) -> int | None:
-    """Find the row index where the table header starts (contains 'Salgssted')."""
-    for i in range(min(len(raw), 200)):  # usually early in the sheet
+def find_old_header_row(raw: pd.DataFrame) -> int | None:
+    """Find header row for old Vipps export (contains 'Salgssted')."""
+    for i in range(min(len(raw), 200)):
         row = raw.iloc[i].astype(str)
         if row.str.contains(r"\bSalgssted\b", case=False, na=False).any():
             return i
     return None
 
+
 def read_vipps_report(uploaded_file) -> pd.DataFrame:
-    """Read Vipps report and return a normalized dataframe."""
-    raw = pd.read_excel(uploaded_file, header=None)
-    header_row = find_header_row(raw)
-    if header_row is None:
-        raise ValueError("Fant ikke header-raden (kolonnen 'Salgssted'). Er dette riktig Vipps-rapport?")
+    """
+    Read Vipps report in either old or new format and return a normalized dataframe.
 
-    df = pd.read_excel(uploaded_file, header=header_row)
+    Internal normalized columns:
+    - LotteriKategori   <- old: Salgssted / new: Kategori
+    - Transaksjonstype  <- old: Transaksjonstype / new: Type
+    - Brutto            <- old: Brutto / new: Beløp
+    - Navn              <- new: Kundens navn (or existing Navn)
+    """
+    xls = pd.ExcelFile(uploaded_file)
 
-    # In many Vipps exports, first data row repeats header labels
-    # Example: first row has "Salgsdato", "Salgssted", etc. as values.
-    if len(df) > 0 and str(df.iloc[0].get("Salgssted", "")).strip().lower() == "salgssted":
-        df.columns = df.iloc[0].tolist()
-        df = df.iloc[1:].copy()
+    preferred_sheets = sorted(
+        xls.sheet_names,
+        key=lambda s: (
+            0 if str(s).strip().lower() == "detaljer" else
+            1 if "detalj" in str(s).lower() else
+            2 if "rapport" in str(s).lower() else
+            3
+        )
+    )
 
-    # Trim whitespace in column names
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+    for sheet_name in preferred_sheets:
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet_name)
+            df.columns = [str(c).strip() for c in df.columns]
+
+            # NEW FORMAT
+            required_new = {"Beløp", "Kundens navn", "Kategori"}
+            if required_new.issubset(df.columns):
+                df = df.copy()
+                df["Brutto"] = df["Beløp"]
+                df["Navn"] = df["Kundens navn"]
+                df["LotteriKategori"] = df["Kategori"]
+
+                if "Type" in df.columns:
+                    df["Transaksjonstype"] = df["Type"]
+                elif "Transaksjonstype" not in df.columns:
+                    df["Transaksjonstype"] = ""
+
+                return df
+
+            # OLD FORMAT
+            required_old = {"Salgssted", "Brutto"}
+            if required_old.issubset(df.columns):
+                df = df.copy()
+                df["LotteriKategori"] = df["Salgssted"]
+
+                if "Transaksjonstype" not in df.columns:
+                    df["Transaksjonstype"] = ""
+
+                return df
+
+        except Exception:
+            pass
+
+        try:
+            raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            header_row = find_old_header_row(raw)
+
+            if header_row is not None:
+                df = pd.read_excel(xls, sheet_name=sheet_name, header=header_row)
+
+                if len(df) > 0 and str(df.iloc[0].get("Salgssted", "")).strip().lower() == "salgssted":
+                    df.columns = df.iloc[0].tolist()
+                    df = df.iloc[1:].copy()
+
+                df.columns = [str(c).strip() for c in df.columns]
+                df = df.copy()
+                df["LotteriKategori"] = df["Salgssted"]
+
+                if "Transaksjonstype" not in df.columns:
+                    df["Transaksjonstype"] = ""
+
+                return df
+        except Exception:
+            pass
+
+    raise ValueError(
+        "Fant ikke et støttet rapportformat. "
+        "Forventet enten gammel Vipps-rapport eller nytt format med "
+        "'Beløp', 'Kundens navn' og 'Kategori'."
+    )
 
 def build_full_name(row) -> str:
+    # New format
+    navn = str(row.get("Navn", "")).strip()
+    if navn and navn.lower() != "nan":
+        return navn
+
+    # Old format
     fn = str(row.get("Fornavn", "")).strip()
     en = str(row.get("Etternavn", "")).strip()
 
     if fn and fn.lower() != "nan":
         return (fn + " " + en).strip() if en and en.lower() != "nan" else fn
 
-    # Fallback: sometimes "Melding" contains name
+    # Fallback
     msg = str(row.get("Melding", "")).strip()
     if msg and msg.lower() != "nan":
         return msg
@@ -59,78 +131,6 @@ def extract_bilde(salgssted: str) -> str | None:
         return None
     m = BILDE_RE.search(str(salgssted))
     return m.group(1).upper() if m else None
-
-def copy_button(text: str, label: str = "📋 Kopiér liste"):
-    btn_id = f"copy_{uuid.uuid4().hex}"
-
-    safe = (
-        text.replace("\\", "\\\\")
-            .replace("`", "\\`")
-            .replace("$", "\\$")
-    )
-
-    components.html(
-        f"""
-        <style>
-          .gc-copy-btn {{
-            appearance: none;
-            background: white;
-            color: rgb(17, 24, 39);
-            border: 1px solid rgba(49, 51, 63, 0.2);
-            border-radius: 0.5rem;
-            padding: 0.6rem 1rem;
-            font-size: 1rem;
-            font-weight: 600;
-            font-family: inherit;
-            line-height: 1.2;
-            cursor: pointer;
-            width: 100%;
-            min-height: 2.75rem;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-            user-select: none;
-            transition: background 120ms ease, border-color 120ms ease, transform 80ms ease;
-          }}
-          .gc-copy-btn:hover {{
-            background: rgba(0, 0, 0, 0.02);
-            border-color: rgba(49, 51, 63, 0.35);
-          }}
-          .gc-copy-btn:active {{
-            transform: translateY(1px);
-          }}
-          .gc-copy-wrap {{
-            width: 100%;
-          }}
-        </style>
-
-        <div class="gc-copy-wrap">
-          <button id="{btn_id}" class="gc-copy-btn">{html.escape(label)}</button>
-        </div>
-
-        <script>
-          const btn = document.getElementById("{btn_id}");
-          const original = btn.textContent;
-
-          btn.addEventListener("click", async () => {{
-            try {{
-              await navigator.clipboard.writeText(`{safe}`);
-              btn.textContent = "✅ Kopiert!";
-              setTimeout(() => {{
-                btn.textContent = original;
-              }}, 1400);
-            }} catch (e) {{
-              btn.textContent = "⚠️ Feil – kopier manuelt";
-              setTimeout(() => {{
-                btn.textContent = original;
-              }}, 2000);
-            }}
-          }});
-        </script>
-        """,
-        height=60,
-    )
 
 def as_int_floor(x) -> int:
     try:
@@ -168,27 +168,32 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-required_cols = {"Salgssted", "Transaksjonstype", "Brutto"}
+required_cols = {"LotteriKategori", "Transaksjonstype", "Brutto"}
 missing = [c for c in required_cols if c not in df.columns]
 if missing:
     st.error(f"Mangler forventede kolonner i rapporten: {missing}")
     st.stop()
 
 # Normalize & filter relevant rows
-df["Salgssted"] = df["Salgssted"].astype(str)
-df["Transaksjonstype"] = df["Transaksjonstype"].astype(str)
+df["LotteriKategori"] = df["LotteriKategori"].astype(str).str.strip()
+df["Transaksjonstype"] = df["Transaksjonstype"].astype(str).str.strip().str.lower()
 
 df_lodd = df[
-    df["Transaksjonstype"].str.strip().str.lower().eq("salg")
-    & df["Salgssted"].str.contains("Lodd bilde", case=False, na=False)
+    df["LotteriKategori"].str.contains(r"lodd\s*bilde", case=False, na=False)
+    & df["Transaksjonstype"].isin(["salg", "belastning", ""])
 ].copy()
 
 if df_lodd.empty:
-    st.warning("Fant ingen lodd-rader (Transaksjonstype='Salg' og Salgssted inneholder 'Lodd bilde').")
+    st.warning("Fant ingen lodd-rader der kategori/salgssted inneholder 'Lodd bilde'.")
     st.stop()
 
-df_lodd["Bilde"] = df_lodd["Salgssted"].apply(extract_bilde)
+df_lodd["Bilde"] = df_lodd["LotteriKategori"].apply(extract_bilde)
+
 df_lodd = df_lodd[df_lodd["Bilde"].notna()].copy()
+
+if df_lodd.empty:
+    st.error("Fant lodd-rader, men klarte ikke å lese bildebokstav fra 'LotteriKategori'.")
+    st.stop()
 
 # Brutto numeric
 df_lodd["Brutto"] = pd.to_numeric(df_lodd["Brutto"], errors="coerce").fillna(0)
@@ -237,6 +242,9 @@ st.success(f"✅ Fant {len(df_lodd)} lodd fordelt på {len(bilder)} bilder.")
 
 st.subheader("Velg bilde under for å se deltakerliste og statistikk:")
 
+if not bilder:
+    st.error("Fant ingen bilder å vise. Sjekk kolonnen 'LotteriKategori' og regexen i extract_bilde().")
+    st.stop()
 tabs = st.tabs([f"Bilde {b}" for b in bilder])
 
 WHEEL_URL = "https://wheelofnames.com/"
@@ -323,9 +331,9 @@ for tab, bilde in zip(tabs, bilder):
                     df_dbg["Lodd_raw"] = df_dbg["Brutto"] / float(loddpris)
 
                     # Velg kolonner som finnes
-                    cols = [c for c in ["Salgsdato", "Salgssted", "Navn", "Brutto", "Lodd_raw", "Melding"] if c in df_dbg.columns]
+                    cols = [c for c in ["Tidspunkt", "Salgsdato", "LotteriKategori", "Navn", "Brutto", "Lodd_raw", "Melding"] if c in df_dbg.columns]
                     df_dbg = df_dbg[cols].rename(columns={
-                        "Salgssted": "Kjøp",
+                        "LotteriKategori": "Kjøp",
                         "Brutto": "Betalt sum",
                         "Lodd_raw": "Betalt / Pris per lodd",
                     })
